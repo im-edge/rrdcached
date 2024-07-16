@@ -2,6 +2,8 @@
 
 namespace IMEdge\RrdCached;
 
+use InvalidArgumentException;
+
 class RrdCachedStats
 {
     // Hint: this should all be unsigned integers, using int is technically not correct
@@ -21,7 +23,7 @@ class RrdCachedStats
      *
      * @var int
      */
-    public int $dDataSetsWritten;
+    public int $dataSetsWritten;
     /** @var int Number of nodes in the cache */
     public int $treeNodesNumber;
     /** @var int Depth of the tree used for fast key lookup */
@@ -36,11 +38,15 @@ class RrdCachedStats
      *
      * @param string[] $resultRows
      */
-    public static function parseResultRows(array $resultRows): RrdCachedStats
+    public static function parse(array $resultRows): RrdCachedStats
     {
-        $self = new static();
+        $self = new RrdCachedStats();
         foreach ($resultRows as $line) {
-            [$key, $value] =  preg_split('/:\s/', $line, 2);
+            if ($keyVal = preg_split('/:\s/', $line, 2)) {
+                [$key, $value] = $keyVal;
+            } else {
+                throw new InvalidArgumentException('RrdCachedStats parse error: ' . $line);
+            }
             $self->{lcfirst($key)} = (int) $value;
         }
 

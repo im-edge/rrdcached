@@ -14,17 +14,18 @@
     },
     "autoload": {
         "psr-4": {
-            "IMEdge\\RRDcached\\": "src/"
+            "IMEdge\\RrdCached\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "IMEdge\\Tests\\RRDcached\\": "tests/"
+            "IMEdge\\Tests\\RrdCached\\": "tests/"
         }
     },
     "require": {
         "php": ">=8.1",
         "ext-ctype": "*",
+        "amphp/socket": "^2.3",
         "imedge/rrd-structure": ">=0.1",
         "psr/log": "^1.0|^3.0"
     },

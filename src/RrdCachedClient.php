@@ -2,15 +2,23 @@
 
 namespace IMEdge\RrdCached;
 
+use Amp\ByteStream\ClosedException;
+use Amp\ByteStream\StreamException;
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
+use Amp\Socket\ConnectException;
+use Amp\Socket\Socket;
 use Exception;
 use IMEdge\RrdStructure\DsList;
 use IMEdge\RrdStructure\RraSet;
 use IMEdge\RrdStructure\RrdInfo;
 use Psr\Log\LoggerInterface;
-use React\Socket\ConnectionInterface;
-use React\Socket\UnixConnector;
+use Revolt\EventLoop;
 use RuntimeException;
 
+use function Amp\Socket\connect;
 use function array_shift;
 use function count;
 use function ctype_digit;
@@ -29,14 +37,16 @@ class RrdCachedClient
 {
     public const ON_CLOSE = 'close';
 
-    protected ?ConnectionInterface $connection = null;
-    protected ?PromiseInterface $currentBatch = null;
-    /** @var Deferred[] */
+    protected ?DeferredFuture $currentBatch = null;
+    /** @var DeferredFuture[] */
     protected array $pending = [];
     protected array $pendingCommands = [];
     protected string $buffer = '';
     protected array $bufferLines = [];
     protected ?array $availableCommands = null;
+    protected ?Socket $socket = null;
+    protected ?DeferredCancellation $connectionCanceller = null;
+    protected bool $debugCommunication = false;
 
     public function __construct(
         protected string $socketFile,
@@ -44,19 +54,36 @@ class RrdCachedClient
     ) {
     }
 
+    public function debugCommunication(bool $debug = true): void
+    {
+        $this->debugCommunication = $debug;
+    }
+
+    public function close(): void
+    {
+        if ($this->connectionCanceller) {
+            $this->connectionCanceller->cancel();
+            $this->connectionCanceller = null;
+        }
+        $this->socket?->close();
+        $this->socket = null;
+        $this->rejectAllPending(new Exception('RrdCached client closed'));
+    }
+
     /**
      * When resolved usually returns 'PONG'
      */
     public function ping(): string
     {
-        return $this->send(RrdCachedCommand::PING);
+        $result = $this->send(RrdCachedCommand::PING);
+        assert(is_string($result));
+
+        return $result;
     }
 
     public function stats(): RrdCachedStats
     {
-        return $this->send(RrdCachedCommand::STATS)->then(static function ($resultRows) {
-            return RrdCachedResultParser::parseStats($resultRows);
-        });
+        return RrdCachedStats::parse($this->send(RrdCachedCommand::STATS));
     }
 
     /**
@@ -76,21 +103,19 @@ class RrdCachedClient
      * @param array<int, string> $commands
      * @return array<int, string>|bool
      */
-    public function batch(array $commands): array|bool
+    public function batch(array $commands, ?Cancellation $cancellation = null): array|bool
     {
         if (empty($commands)) {
             throw new RuntimeException('Cannot run BATCH with no command');
         }
         if ($this->currentBatch) {
-            return $this->currentBatch->then(function () use ($commands) {
-                // $this->logger->warning(
-                //     'RRDCacheD: a BATCH is already in progress, queuing up.'
-                //     . ' This could be a bug, please let us know!'
-                // );
-
-                return $this->batch($commands);
-            });
+            $this->currentBatch->getFuture()->await();
+            // $this->logger->warning(
+            //     'RRDCacheD: a BATCH is already in progress, queuing up.'
+            //     . ' This could be a bug, please let us know!'
+            // );
         }
+        $this->currentBatch = new DeferredFuture();
 
         // TODO: If a command manages it to be transmitted between "BATCH" and
         // it's commands, this could be an undesired race condition. We should
@@ -98,38 +123,38 @@ class RrdCachedClient
         // other blocking logic.
         $commands = implode("\n", $commands) . "\n.";
 
+        if (! $this->send(RrdCachedCommand::BATCH)) {
+            throw new RuntimeException('Failed to start RrdCached BATCH');
+        }
         // BATCH gives: 0 Go ahead.  End with dot '.' on its own line.
-        return $this->currentBatch = $this->send(RrdCachedCommand::BATCH)->then(function ($result) use ($commands) {
-            return $this->send($commands)->then(function ($result) {
-                if ($result === 'errors' || $result === true) { // TODO: either one or the other
-                    // Was: '0 errors'
-                    return true;
+        $result = $this->send($commands);
+        $this->currentBatch = null;
+        if ($result === 'errors' || $result === true) { // TODO: either one or the other
+            // Was: '0 errors'
+            return true;
+        }
+        if (is_string($result)) {
+            $this->logger?->notice('Unknown positive result when starting a batch string: ' . $result);
+            // Well... unknown string, but anyway: no error
+            return true;
+        }
+        if (is_array($result)) {
+            $res = [];
+            foreach ($result as $line) {
+                assert(is_string($line));
+                if (preg_match('/^(\d+)\s(.+)$/', $line, $match)) {
+                    $res[(int) $match[1]] = $match[2];
+                } else {
+                    throw new RuntimeException(
+                        'Unexpected result from BATCH: ' . implode('\\n', $result)
+                    );
                 }
-                if (is_string($result)) {
-                    $this->logger->debug('Unknown positive result string: ' . $result);
-                    // Well... unknown string, but anyway: no error
-                    return true;
-                }
-                if (is_array($result)) {
-                    $res = [];
-                    foreach ($result as $line) {
-                        if (preg_match('/^(\d+)\s(.+)$/', $line, $match)) {
-                            $res[(int) $match[1]] = $match[2];
-                        } else {
-                            throw new RuntimeException(
-                                'Unexpected result from BATCH: ' . implode('\\n', $result)
-                            );
-                        }
-                    }
+            }
 
-                    return $res;
-                }
+            return $res;
+        }
 
-                throw new RuntimeException('Unexpected result from BATCH: ' . \var_export($result, 1));
-            })->always(function () {
-                $this->currentBatch = null;
-            });
-        });
+        throw new RuntimeException('Unexpected result from BATCH: ' . \var_export($result, true));
     }
 
     /**
@@ -140,19 +165,15 @@ class RrdCachedClient
      */
     public function flushAll(): bool
     {
-        return $this->send(RrdCachedCommand::FLUSH_ALL)->then(function ($result) {
-            // $result is 'Started flush.'
-            return true;
-        });
+        $this->send(RrdCachedCommand::FLUSH_ALL);
+        // $result is 'Started flush.'
+        return true;
     }
 
     public function first(string $file, int $rra = 0): int
     {
         $file = static::quoteFilename($file);
-
-        return $this->send(RrdCachedCommand::FIRST . " $file $rra")->then(function ($result) {
-            return (int) $result;
-        });
+        return (int) $this->send(RrdCachedCommand::FIRST . " $file $rra");
     }
 
     /**
@@ -164,75 +185,59 @@ class RrdCachedClient
     public function last(string $file): int
     {
         $file = static::quoteFilename($file);
-
-        return $this->send(RrdCachedCommand::LAST . " $file")->then(function ($result) {
-            return (int) $result;
-        })->otherwise(function (Exception $e) {
-            return Error::forException($e);
-        });
+        return (int) $this->send(RrdCachedCommand::LAST . " $file");
     }
 
     public function flush(string $file): bool
     {
         $file = static::quoteFilename($file);
 
-        return $this->send(RrdCachedCommand::FLUSH . " $file")->then(function ($result) {
-            // $result is 'Successfully flushed <path>/<filename>.rrd.'
-            return true;
-        });
+        $result = $this->send(RrdCachedCommand::FLUSH . " $file");
+        // $result is 'Successfully flushed <path>/<filename>.rrd.'
+        return true;
     }
 
     public function forget(string $file): bool
     {
         $file = static::quoteFilename($file);
 
-        return $this->send(RrdCachedCommand::FORGET . " $file")->then(function ($result) use ($file) {
+        try {
+            $result = $this->send(RrdCachedCommand::FORGET . " $file");
             // $result is 'Gone!'
-            $this->logger->debug("Forgot $file: $result");
+            $this->logger?->debug("Forgot $file: $result");
             return true;
-        })->otherwise(function ($result) use ($file) {
-            // $result is 'No such file or directory'
-            $this->logger->debug("Failed to forgot $file: $result");
+        } catch (Exception $e) {
+            $this->logger?->notice("Failed to forget $file: " . $e->getMessage());
             return false;
-        });
+        }
     }
 
     public function flushAndForget(string $file): bool
     {
         $file = static::quoteFilename($file);
 
-        return $this->flush($file)->then(function () use ($file) {
-            return $this->forget($file);
-        });
+        $this->flush($file);
+        return $this->forget($file);
     }
 
+    /**
+     * @return string[]
+     */
     public function pending(string $file): array
     {
         $file = static::quoteFilename($file);
-        return $this->send(RrdCachedCommand::PENDING . " $file")->then(function ($result) {
-            if (is_array($result)) {
-                return $result;
-            }
+        $result = $this->send(RrdCachedCommand::PENDING . " $file");
+        if (is_array($result)) {
+            return $result;
+        }
 
-            // '0 updates pending', so $result is 'updates pending'
-            return [];
-        })->otherwise(function () {
-            return [];
-        });
+        // '0 updates pending', so $result is 'updates pending'
+        return [];
     }
 
     public function info(string $file): RrdInfo
     {
-        return $this->rawInfo($file)->then(function ($result) {
-            return RrdInfo::parseLines($result);
-        });
-    }
-
-    public function tune(string $file, ...$parameters): RrdInfo
-    {
-        return $this->send(implode(' ', array_merge([$file], $parameters)))->then(function ($result) {
-            return RrdInfo::parseLines($result);
-        });
+        return RrdInfo::parseLines($this->rawInfo($file));
     }
 
     public function rawInfo(string $file): array
@@ -242,13 +247,29 @@ class RrdCachedClient
         return $this->send(RrdCachedCommand::INFO . " $file");
     }
 
+    public function tune(string $file, ...$parameters): bool
+    {
+        $result = $this->send(implode(' ', array_merge(
+            [RrdCachedCommand::TUNE, static::quoteFilename($file)],
+            $parameters
+        )));
+
+        if (is_bool($result)) {
+            $this->logger->debug('tune gives a boolean, TODO: remove this check');
+        } else {
+            $this->logger->debug('tune gives no boolean, TODO: fix this: ' . var_export($result, true));
+        }
+
+        return true;
+    }
+
     protected function createFile(
         string $filename,
         int $step,
         int $start,
         DsList $dsList,
         RraSet $rraSet
-    ): PromiseInterface {
+    ): bool {
         return $this->send(\sprintf(
             RrdCachedCommand::CREATE . " %s -s %d -b %d %s %s",
             static::quoteFilename($filename),
@@ -266,150 +287,119 @@ class RrdCachedClient
         return "'" . addcslashes($filename, "'") . "'";
     }
 
+    /**
+     * @return string[]
+     */
     public function listAvailableCommands(): array
     {
-        $deferred = new Deferred();
-        if ($this->availableCommands === null) {
-            $this->send(RrdCachedCommand::HELP)->then(function ($result) use ($deferred) {
-                $this->availableCommands = RrdCachedResultParser::extractAvailableCommandsFromHelp($result);
-                $deferred->resolve($this->availableCommands);
-            }, function (Exception $e) use ($deferred) {
-                $this->logger->error($e->getMessage());
-                $deferred->reject($e);
-            });
-        } else {
-            Loop::futureTick(function () use ($deferred) {
-                try {
-                    $deferred->resolve($this->availableCommands);
-                } catch (\Throwable $e) {
-                    $this->logger->error($e->getMessage());
-                }
-            });
-        }
-
-        return $deferred->promise();
+        return $this->availableCommands ??= RrdCachedResultParser::extractAvailableCommandsFromHelp(
+            RrdCachedResultParser::extractAvailableCommandsFromHelp($this->send(RrdCachedCommand::HELP))
+        );
     }
 
     public function hasCommand(string $commandName): bool
     {
-        return $this
-            ->listAvailableCommands()
-            ->then(function ($commands) use ($commandName) {
-                return in_array($commandName, $commands);
-            });
+        return in_array($commandName, $this->listAvailableCommands());
     }
 
+    /**
+     * @return string[]
+     */
     public function listFiles(string $directory = '/'): array
     {
-        return $this->send(RrdCachedCommand::LIST . " $directory")->then(function ($result) {
-            sort($result);
+        $result = $this->send(RrdCachedCommand::LIST . " $directory");
+        sort($result);
 
-            return $result;
-        });
+        return $result;
     }
 
+    /**
+     * @return string[]
+     */
     public function listRecursive(string $directory = '/'): array
     {
-        return $this->send(RrdCachedCommand::LIST_RECURSIVE . " $directory")->then(function ($result) {
-            sort($result);
+        $result = $this->send(RrdCachedCommand::LIST_RECURSIVE . " $directory");
+        sort($result);
 
-            return $result;
-        });
+        return $result;
     }
 
     public function quit(): void
     {
-        if ($this->connection === null) {
+        if ($this->socket === null) {
+            return;
+        }
+        $deferred = new DeferredFuture();
+        $this->socket->onClose(fn () => $deferred->complete());
+        try {
+            $this->socket->write(RrdCachedCommand::QUIT);
+        } catch (ClosedException $e) {
+            return;
+        } catch (StreamException $e) {
+            $this->close();
             return;
         }
 
-        $deferred = new Deferred();
-        $this->connection->on('close', function () use ($deferred) {
-            $deferred->resolve();
-        });
-
-        $this->connection->write(RrdCachedCommand::QUIT);
-
-        return $deferred->promise();
+        $deferred->getFuture()->await();
     }
 
-    public function send(string $command): PromiseInterface
+    /**
+     * @param string $command
+     * @param Cancellation|null $canceller
+     * @return array<string|bool>|string|bool
+     * @throws StreamException
+     * @throws CancelledException
+     */
+    public function send(string $command, ?Cancellation $canceller = null): string|array|bool
     {
+        // TODO: reject commands with "\n"?
+        $socket = $this->getSocket();
         $command = rtrim($command, "\n");
-        $this->pending[] = $deferred = new Deferred();
-        $this->pendingCommands[] = $command;
-        // Logger::debug
-        // echo "Sending $command\n";
+        $socket->write("$command\n");
 
-        // foreach (\preg_split('/\r\n/', "$command") as $l) {
-        //     echo "> $l\n";
-        // }
-        if ($this->connection === null) {
-            $this->logger->debug("Not yet connected, deferring $command");
-            $this->connect()->then(function () use ($command, $deferred) {
-                $this->logger->debug("Connected to RRDCacheD, now sending $command");
-                $this->connection->write("$command\n");
-            })->otherwise(function (Exception $error) use ($deferred) {
-                $this->logger->error('Connection to RRDCacheD failed');
-                $deferred->reject($error);
-            });
-        } else {
-            // TODO: Drain if false?
-            $this->connection->write("$command\n");
+        $this->pending[] = $deferred = new DeferredFuture();
+        $this->pendingCommands[] = $command;
+        if ($this->debugCommunication) {
+            foreach (explode("\n", $command) as $l) {
+                $this->logger?->debug("rrdCached > $l");
+            }
         }
 
-        // Hint: used to be 5s, too fast?
-        return timeout($deferred->promise(), 30);
+        return $deferred->getFuture()->await($canceller);
     }
 
-    protected function connect()
+    /**
+     * @throws ConnectException
+     * @throws CancelledException
+     */
+    protected function getSocket(): Socket
     {
-        $this->availableCommands = null;
-        $connector = new UnixConnector();
+        if ($this->socket === null) {
+            $this->connectionCanceller = new DeferredCancellation();
+            $socket = connect('unix://' . $this->socketFile);
+            $this->logger?->notice('RRDCacheD Client connected to ' . $this->socketFile);
+            $socket->onClose(function () {
+                $this->logger?->notice('RRDCacheD Client closed');
+                $this->rejectAllPending(new Exception('Connection closed'));
+            });
+            $this->socket = $socket;
+            EventLoop::queue(fn () => $this->keepReadingFromSocket($socket));
+        }
 
-        $attempt = $connector->connect($this->socketFile)->then(function (ConnectionInterface $connection) {
-            $this->connection = $connection;
-            $this->initializeHandlers($connection);
-        })->otherwise(function (Exception $e) {
-            $this->logger->error('RRDCached connection error: ' . $e->getMessage());
-            throw $e;
-        });
-
-        return timeout($attempt, 5);
+        return $this->socket;
     }
 
-    protected function initializeHandlers(ConnectionInterface $connection)
+    protected function keepReadingFromSocket(Socket $socket): void
     {
-        $connection->on('end', function () {
-            $this->logger->info('RRDCacheD Client ended');
-            $this->connection = null;
-        });
-        $connection->on('error', function (\Exception $e) {
-            $this->rejectAllPending($e);
-            $this->logger->error('RRDCacheD Client error: ' . $e->getMessage());
-            $this->connection = null;
-        });
+        while (null !== ($data = $socket->read())) {
+            $this->buffer .= $data;
+            $this->processBuffer();
+        }
 
-        $connection->on('close', function () {
-            $this->logger->info('RRDCacheD Client closed');
-            // In case of an error, they should already have been rejected
-            $this->rejectAllPending(new RuntimeException('RRDCacheD Client closed'));
-            $this->emit(self::ON_CLOSE);
-            $this->connection = null;
-        });
-
-        $connection->on('data', function ($data) {
-            $this->processData($data);
-        });
+        $this->socket = null;
     }
 
-    protected function processData($data)
-    {
-        $this->buffer .= $data;
-        $this->processBuffer();
-    }
-
-    protected function processBuffer()
+    protected function processBuffer(): void
     {
         $offset = 0;
 
@@ -426,34 +416,39 @@ class RrdCachedClient
         $this->checkForResults();
     }
 
-    protected function checkForResults()
+    protected function checkForResults(): void
     {
         while (! empty($this->bufferLines)) {
             $current = $this->bufferLines[0];
             $pos = strpos($current, ' ');
             if ($pos === false) {
                 $this->failForProtocolViolation();
+                return;
             }
             $cntLines = substr($current, 0, $pos);
-            // $this->logger->debug("< $current");
+            if ($this->debugCommunication) {
+                $this->logger?->debug("rrdCached < $current");
+            }
             if ($cntLines === '-1') {
                 array_shift($this->bufferLines);
                 $this->rejectNextPending(substr($current, $pos + 1));
-            } elseif (ctype_digit($cntLines)) {
+                continue;
+            }
+            if (ctype_digit($cntLines)) {
                 $cntLines = (int) $cntLines;
 
                 if ($cntLines === 0) {
                     if (empty($this->pending)) {
                         $this->failForProtocolViolation();
+                        return;
                     }
 
                     array_shift($this->bufferLines);
                     $result = substr($current, $pos + 1);
-                    if ($result === 'errors') { // Output: 0 errors
+                    if (strtolower($result) === 'errors') { // Output: 0 errors
                         $result = true;
                     }
                     $this->resolveNextPending($result);
-
                     continue;
                 }
                 if (count($this->bufferLines) <= $cntLines) {
@@ -479,30 +474,39 @@ class RrdCachedClient
         }
     }
 
-    protected function resolveNextPending($result)
+    /**
+     * @param array<string|bool>|string|bool $result
+     * @return void
+     */
+    protected function resolveNextPending(array|string|bool $result): void
     {
-        if (empty($this->pending)) {
-            $this->failForProtocolViolation();
-        }
-        $next = array_shift($this->pending);
         array_shift($this->pendingCommands);
-        $next->resolve($result);
-    }
-
-    protected function rejectNextPending($message)
-    {
         $next = array_shift($this->pending);
-        $command = array_shift($this->pendingCommands);
-        $command = preg_replace('/\s.*$/', '', $command);
-        $next->reject(new RuntimeException("$command: $message"));
+        if ($next === null) {
+            $this->failForProtocolViolation();
+            return;
+        }
+
+        $next->complete($result);
     }
 
-    protected function failForProtocolViolation()
+    protected function rejectNextPending(string $message): void
+    {
+        $command = array_shift($this->pendingCommands);
+        $next = array_shift($this->pending);
+        if ($next === null) {
+            $this->failForProtocolViolation();
+            return;
+        }
+        $command = preg_replace('/\s.*$/', '', $command);
+        $next->error(new RuntimeException("$command: $message"));
+    }
+
+    protected function failForProtocolViolation(): void
     {
         $exception = new RuntimeException('Protocol exception, got: ' . $this->getFullBuffer());
         $this->rejectAllPending($exception);
-        $this->connection->close();
-        unset($this->connection);
+        $this->close();
     }
 
     protected function getFullBuffer(): string
@@ -514,10 +518,13 @@ class RrdCachedClient
         return implode("\n", $this->bufferLines) . "\n" . $this->buffer;
     }
 
-    protected function rejectAllPending(Exception $exception)
+    protected function rejectAllPending(Exception $exception): void
     {
-        foreach ($this->pending as $deferred) {
-            $deferred->reject($exception);
+        $pending = $this->pending;
+        $this->pending = [];
+        $this->pendingCommands = [];
+        foreach ($pending as $deferred) {
+            $deferred->error($exception);
         }
     }
 }
