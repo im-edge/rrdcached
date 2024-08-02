@@ -50,6 +50,7 @@ class RrdCachedClient
 
     public function __construct(
         protected string $socketFile,
+        protected string $dataDir,
         protected readonly ?LoggerInterface $logger = null
     ) {
     }
@@ -237,7 +238,7 @@ class RrdCachedClient
 
     public function info(string $file): RrdInfo
     {
-        return RrdInfo::parseLines($this->rawInfo($file));
+        return RrdInfo::parseLines($this->rawInfo($file), $this->dataDir);
     }
 
     public function rawInfo(string $file): array
