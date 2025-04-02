@@ -25,7 +25,7 @@
     "require": {
         "php": ">=8.1",
         "ext-ctype": "*",
-        "amphp/socket": "^2",
+        "imedge/amphp-socket": "^2.3.1",
         "imedge/rrd-structure": ">=0.4",
         "psr/log": "^1.0|^3.0"
     },
